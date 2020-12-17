@@ -1,0 +1,306 @@
+---
+title: "2020-12-17 Exploring Michale's Data"
+output: html_notebook
+---
+
+## Objective 
+
+* Take a look at what kind of data MW actually sent us, is it monthly or annual data? 
+* Define the functions that can be used to to calculate the trend line 
+  * linear regression
+  * smooth regression 
+  * 20 EOC - historical mean
+  
+This will most likely be with cmip5
+
+# CMIP 5 
+
+## Taking a look at the MW's data! 
+
+```{r}
+library(ncdf4)
+library(magrittr)
+library(ggplot2)
+library(raster)
+library(assertthat)
+```
+
+```{r}
+INPUT <- here::here('inputs', 'metric')
+```
+
+
+```{r}
+nc1 <- nc_open(file.path(INPUT, 'TN_CESM1-CAM5_historical_rcp85_r10i1p1_192001-210012.nc'))
+TNx_d <- ncvar_get(nc1, 'TNx')
+t <- ncvar_get(nc1, 'time')
+ncatt_get(nc1, 'time')
+summary(unlist(TNx_d))
+1800 + 120
+1800 + 300
+```
+
+So it looks like the TN file returns TNx values, min daily temperature with the variable name 'TNx'.
+
+```{r}
+nc2 <- nc_open(file.path(INPUT, 'TX_CanESM2_historical_rcp85_r10i1p1_19500101-21001231.nc'))
+nc2
+TXx_d <- ncvar_get(nc2, 'TXx')
+t <- ncvar_get(nc2, 'time')
+ncatt_get(nc2, 'time')
+summary(unlist(TXx_d))
+
+
+# okay so so this has both of the TXx and the TXn 
+
+TXx_d <- ncvar_get(nc2, 'TXx')
+TXn_d <- ncvar_get(nc2, 'TXn')
+```
+
+```{r}
+summary(unlist(TXx_d))
+```
+
+```{r}
+summary(unlist(TXx_d) - unlist(TXn_d))
+```
+
+
+```{r}
+t
+```
+
+
+```{r}
+nc3 <- nc_open(file.path(INPUT, 'Rx1Day_CanESM2_historical_rcp85_r14i1p1_19500101-21001231.nc'))
+Rx1day_DJF_d <- ncvar_get(nc3, 'Rx1day_MAM')
+t <- ncvar_get(nc3, 'time')
+ncatt_get(nc3, 'time')
+summary(unlist(Rx1day_DJF_d))
+```
+
+
+```{r}
+nc3
+```
+
+
+Okay so what I've learned here is that there are mulitple variables in each netcdf file, which is good because I was worried that some of the things were missing. This will make is difficult to designing the function but all the same is really good to know. 
+
+So TN has both TNn and TNx 
+TX has both TXn and TXx 
+
+and then the percip values are broken up by different seasons and also an annual one which is awesome! 
+
+```
+Rx1day_DJF
+Rx1day_MAM
+Rx1day_SON
+Rx1day_JJA
+Rx1day_annual
+```
+
+
+# Exploring the data 
+
+What would be easier, to do this in python, cdo, or R? 
+
+```{r}
+# Let's start with some of the temp data 
+data <- TNx_d
+t <- ncvar_get(nc1, 'time')
+# Select the first lat and lon index at all of the different time steps
+df <- data.frame(value = data[1, 1, ], 
+                 time = t)
+
+ggplot(data = df, aes(time, value)) + 
+  geom_point() + 
+  stat_smooth(method="lm") +
+  stat_smooth(method="gam", color = 'red') +
+  labs(title = 'Looking at Temp in 1 grid', y = 'K', x = 'year') ->
+  x
+
+
+
+
+```
+
+```{r}
+
+lm(data[1, 1, ] ~ t)
+ 
+sub <- data[1:10, 1:10, ]
+dim(sub) # so here is a our mini data 
+
+```
+
+# The most important part of the script! 
+
+Here the functions for extracting the slope values are defined as well as the function that was used to create the functions 
+
+```{r}
+# The easiest thing to do is to flatten the dimensions of the files 
+ntime <- dim(data)[3]
+nlon  <- dim(data)[1]
+nlat  <- dim(data)[2]
+
+# Transfrom the data array that was read in from the netcdf file 
+# into a 2D object that can is easier to apply functions to. 
+# Args 
+#   data: a 3D array (lon, lat, time)
+#   nlon: dimensions of longitude
+#   nlat: dimensions of latitude
+# Returns: a 2D array (time, lon/lat)
+reshape_3Darray <- function(data, nlon, nlat, ntime){
+  
+  # Make sure that we are reading in the 3d array 
+  assert_that(length(dim(data)) == 3)
+  
+  # Parse out the lat/lon information. 
+  nlon  <- dim(data)[1]
+  nlat  <- dim(data)[2]
+  ntime <- dim(data)[3]
+  
+  # Flatten out the array into a 2d array 
+  flat      <- aperm(data, c(3, 2, 1))
+  dim(flat) <- c(ntime, nlat * nlon)
+  
+  return(flat)
+  
+}
+
+# Calculate change in trend via linear regression 
+# Args 
+#   data: a 2D array (time, lon/lat) created by the reshape_3Darray function 
+#   nlon: dimensions of longitude
+#   nlat: dimensions of latitude
+# Returns: a matrix of the change by lon/lat
+calculate_lm_slope <- function(data, nlon, nlat){
+  
+  # Make sure that the flat data is being read in 
+  assert_that(length(dim(data)) == 2)
+  
+  # Now calculate the slope 
+  slope_vector <- apply(data, 2, function(y){
+    lm(y ~ t)$coefficients[2]
+    })
+  
+  # Transform the results into a matrix by lat/lon 
+  lm_results <- matrix(data = slope_vector, nrow = nlon, ncol = nlat, byrow = TRUE)
+
+  return(lm_results)
+}
+
+# Calculate change via the difference in EOC
+# Args
+#   data: a 2D array (time, lon/lat) created by the reshape_3Darray function 
+#   period_len: the length of the two different periods to take the average over  
+#   nlon: dimensions of longitude
+#   nlat: dimensions of latitude
+# Returns: a matrix of the difference by lon/lat
+calculate_EOC_diff <- function(data, nlon, nlat, period_len = 20){
+  
+  # Make sure that the flat data is being read in 
+  assert_that(length(dim(data)) == 2)
+  
+  # Now calculate the difference between the historical and eoc mean. 
+  diff_vector <- apply(data,2, function(y){
+    
+    # Historical average
+    hist_avg <- mean(head(y, period_len))
+    
+    # The end of century average 
+    eoc_avg <- mean(tail(y, period_len))
+    
+    # Calculate the difference 
+    diff <- eoc_avg - hist_avg
+    return(diff)
+    
+  })
+  
+  # Transform the results into a matrix by lat/lon 
+  diff_results <- matrix(data = diff_vector, nrow = nlon, ncol = nlat, byrow = TRUE)
+  
+}
+
+# DEFINE SOME FUNCTION THAT WILL DO IT THE THIRD WAY
+
+# Make the netcdf 
+# Args 
+#   lm_rslts: the data returned by calculate_lm_slope
+#   diff_rslts: the data returned by calculate_EOC_diff
+#   lat: lattitude values 
+#   lon: longitude values
+#   info: a data frame containing information about the variable, model, senario,
+#         and ensemble member. 
+#   OUT_DIR: the location where to write the netcdf file out to 
+make_nc <- function(lm_rslts, diff_rslts, lat, lon, info, OUT_DIR){
+   
+   # Check the inputs
+   assert_that(dir.exists(OUT_DIR))
+   assert_that(is.data.frame(info))
+   assert_that(has_name(info, c('scn', 'model', 'ensemble', 'variable')))
+   assert_that(length(dim(lm_rslts)) == 2)
+   assert_that(length(dim(diff_rslts)) == 2)
+
+   
+   # Create the different dimensions for the netcdf file such as the time, lon, and lat
+   dim_time <- ncdim_def('time', 'year', as.double(1)) # We know for a fact only 1 time step
+   dim_lon  <- ncdim_def('lon', 'longitude', as.double(lon))
+   dim_lat  <- ncdim_def('lat', 'latitude', as.double(lat))
+   
+   
+   # Define the dimensions of the variables that will be used in the netcdf file. 
+   lm_var   <- ncvar_def(name = "lm", units = 'NA', dim = list(dim_lon, dim_lat, dim_time),
+                         longname = 'linear regression')
+   diff_var <- ncvar_def(name = "diff", units = 'NA', dim = list(dim_lon, dim_lat, dim_time),
+                         longname = 'difference between eoc and historical')
+   
+   # Name the netcdf file
+   name    <- paste0(c(info$model, info$variable, info$scn, info$ensemble), collapse = '_')
+   nc_name <- file.path(OUT_DIR, paste0(name, '.nc'))
+   
+   # Make the new netcdf file, but first delete the netcdf if it exists because 
+   # the it is not possible to write over an already existing netcdf file. 
+   if(file.exists(nc_name)){ file.remove(nc_name) }
+   ncnew <- nc_create(nc_name, list(lm_var, diff_var), force_v4=TRUE)
+   
+   # Now that the ncdf is prepared, write the values to the netcdf. 
+   ncvar_put(ncnew, "lm", vals = lm_rslts)
+   ncvar_put(ncnew, "diff", vals = diff_rslts)
+   
+   # Define some global attributes 
+   ncatt_put(ncnew, 0, "created_on", as.character(Sys.time()))
+   ncatt_put(ncnew, 0, "scenario", info$scn)
+   ncatt_put(ncnew, 0, "model", info$model)
+   ncatt_put(ncnew, 0, "ensemble", info$ensemble)
+   
+   # Save the netcdf file. 
+   nc_close(ncnew)
+   return(nc_name)
+   
+ } 
+ 
+
+```
+
+```{r}
+# data <- TNx_d
+# ntime <- dim(data)[3]
+# nlon  <- dim(data)[1]
+# nlat  <- dim(data)[2]
+# 
+# d <- reshape_3Darray(data = data, nlon = nlon, nlat = nlat, ntime = ntime)
+# lm_rslts   <- calculate_lm_slope(data = d, nlon = nlon, nlat = nlat)
+# diff_rslts <- calculate_EOC_diff(data = d, nlon = nlon, nlat = nlat)
+# 
+# 
+# make_nc(lm_rslts, diff_rslts, lat, lon, 
+#         info = data.frame(model = 'this', scn = 'is', variable = 'bullshit', 
+#                           ensemble = 'not', stringsAsFactors = FALSE),
+#         OUT_DIR = '/Users/dorh012/Documents/2020/dev-NGD/tes_out')
+
+```
+
+
+
